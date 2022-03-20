@@ -1,0 +1,477 @@
+#include "SeaMask.h"
+
+using namespace std;
+
+bool isInPolygon(HLPoint p, vector<HLPoint>* polygon);
+
+
+//************************************
+// Method:    getSeaMask
+// FullName:  SeaMask::getSeaMask
+// Access:    public
+// Returns:   bool
+// Qualifier: 获取依据矢量得到的海洋掩膜
+// Parameter: std::string inputraster 输入tiff图像的路径
+// Parameter: std::string mainworkpath 工作路径
+// Parameter: unsigned char* mask 海洋和陆地掩膜，用一维数组储存
+// Parameter: int xstart 起始点横坐标
+// Parameter: int xend 终止点横坐标
+// Parameter: int ystart 起始点横坐标
+// Parameter: int yend 终止点横坐标
+//************************************
+bool getSeaMask(std::string inputraster, std::string mainworkpath, unsigned char* mask, int xstart, int xend, int ystart, int yend)
+{
+    int width = xend - xstart; //初始化
+    int height = yend - ystart; //初始化
+    //海岸线缩放因子64,所以将其设置为255
+    memset(mask, 255, (long long)width * height);
+
+    unsigned char * tempMask = (unsigned char*)malloc((width+1000)*(height+1000));
+    if(tempMask == nullptr) //justify pointer
+    {
+        return false;
+    }
+    memset(tempMask,255,(width+1000)*(height + 1000));  //set 0
+    QuickHLFGVector(inputraster, mainworkpath,tempMask,xstart-500,ystart-500,width+1000,height+1000);
+    for(int i = 0;i<height;i++)  //recycle
+    {
+        for(int j = 0;j<width;j++)  //recycle
+        {
+            mask[i*(long long)width + j] = tempMask[(i+500)*((long long)width+ 1000)+j + 500];
+        }
+    }
+    free(tempMask);  //delete memory
+    return true;
+}
+
+
+//************************************
+// Method:    QuickHLFGVector
+// FullName:  SeaMask::QuickHLFGVector
+// Access:    public
+// Returns:   bool
+// Qualifier: 快速海陆分割算法
+// Parameter: string inputraster 输入tiff图像的路径
+// Parameter: string mainworkpath 工作路径
+// Parameter: unsigned char* mask 海洋和陆地掩膜，用一维数组储存
+// Parameter: int oricol 起始点列
+// Parameter: int orirow 终止点行
+// Parameter: int width 宽度
+// Parameter: int height 高度
+//************************************
+bool QuickHLFGVector(string inputraster, string mainworkpath, unsigned char* mask, int oricol, int orirow, int width, int height)
+{
+    GDALAllRegister();
+    CPLSetConfigOption("GDAL_FILENAME_IS_UTF8", "NO");//中文路径
+//    OGRRegisterAll();
+//    CPLSetConfigOption("GDAL_FILENAME_IS_UTF8", "NO");//中文路径
+    CPLSetConfigOption("SHAPE_ENCODING", "");
+
+    vector<vector<HLPoint>> land_polygons;
+
+    //获取栅格数据文件名称
+    string RasterBaseName = ""; //初始化
+    int baseend = 0; //初始化
+    int basestart = 0; //初始化
+    string tempRasterPath = inputraster; //初始化
+    for (int i = 0; i < tempRasterPath.size(); i++)
+    {
+        if (tempRasterPath[i] == '\\')
+        {
+            tempRasterPath[i] = '/';
+        }
+    }
+    for (int i = tempRasterPath.size() - 1; i >= 0; i--)
+    {
+        if (tempRasterPath[i] == '.')
+        {
+            baseend = i - 1;
+            break;
+        }
+    }
+    for (int i = tempRasterPath.size() - 1; i >= 0; i--)
+    {
+        if (tempRasterPath[i] == '/')
+        {
+            basestart = i + 1;
+            break;
+        }
+    }
+    for (int i = basestart; i <= baseend; i++)
+    {
+        RasterBaseName.append(1, tempRasterPath[i]);
+    }
+    string sSmallVectorPath = mainworkpath + "/src/temp/" + RasterBaseName + "_oricol" + to_string(oricol) + "_orirow" + to_string(orirow) + "_width" + to_string(width) + "_height" + to_string(height) + ".shp";//与栅格数据同一范围的小矢量
+    const char* RasterPath = inputraster.c_str();//输入的栅格图像路径
+    const char* SmallVectorPath = sSmallVectorPath.c_str(); //初始化
+    //const char* OutputPath = outputpath.c_str();//输出栅格图像路径
+
+    //输入栅格图像基本数据
+    int iWidth = 0; //初始化
+    int iHeight = 0; //初始化
+    int iBands = 0; //初始化
+    double OriGeoTrans[6] = {'\0'}; //初始化
+    double GeoTrans[6] = {'\0'}; //初始化
+    //栅格图像元数据解析
+    GDALDataset* poRasterDs = nullptr; //初始化
+    poRasterDs = (GDALDataset*)GDALOpen(RasterPath, GA_ReadOnly); //初始化
+    if (poRasterDs == nullptr)  //justify pointer
+    {
+        cout << "open raster file failed!" << endl;
+        return false;
+    }
+    iWidth = poRasterDs->GetRasterXSize(); //初始化
+    iHeight = poRasterDs->GetRasterYSize(); //初始化
+    iBands = poRasterDs->GetRasterCount(); //初始化
+    poRasterDs->GetGeoTransform(OriGeoTrans); //初始化
+
+    for (int i = 0; i < 6; i++) //初始化
+    {
+        GeoTrans[i] = OriGeoTrans[i];
+    }
+
+    const char* Projection = poRasterDs->GetProjectionRef(); //初始化
+    GDALRasterBand* poBand1 = poRasterDs->GetRasterBand(1); //初始化
+    GDALDataType DataType = poBand1->GetRasterDataType(); //初始化
+    if (iBands > 1)
+    {
+        cout << "can't process multi bands data!" << endl;
+        return false;
+    }
+    OGRSpatialReference *ref = new OGRSpatialReference(poRasterDs->GetProjectionRef()); //初始化
+    OGRSpatialReference *sref = ref->CloneGeogCS(); //初始化
+    OGRCoordinateTransformation *transform = OGRCreateCoordinateTransformation(ref,sref); //初始化
+    OGRCoordinateTransformation *transform2 = OGRCreateCoordinateTransformation(sref,ref); //初始化
+    if(ref == nullptr || sref == nullptr || transform == nullptr || transform2 == nullptr) //justify pointer
+    {
+        return false;
+    }
+    double xmin = GeoTrans[0];double ymax = GeoTrans[3]; //初始化
+    double xmax = GeoTrans[0] + GeoTrans[1] * iWidth; //初始化
+    double ymin = GeoTrans[3] + GeoTrans[5] * iHeight; //初始化
+    transform->Transform(1,&xmin,&ymax);
+    transform->Transform(1,&xmax,&ymin);
+
+    double xxmin = GeoTrans[0] + GeoTrans[1] * oricol; //初始化
+    double xxmax = GeoTrans[0] + GeoTrans[1] * (oricol + width); //初始化
+    double yymax = GeoTrans[3] + GeoTrans[5] * orirow; //初始化
+    double yymin = GeoTrans[3] + GeoTrans[5] * (orirow + height); //初始化
+    transform->Transform(1,&xxmin,&yymax);
+    transform->Transform(1,&xxmax,&yymin);
+    string sxmin = to_string((long double)xxmin);
+    string sxmax = to_string((long double)xxmax);
+    string symin = to_string((long double)yymin);
+    string symax = to_string((long double)yymax);
+    //生成小矢量
+    string program = "ogr2ogr.exe"; //初始化
+    string space = " "; //初始化
+    string argu1 = "-spat"; //初始化
+    string argu2 = "-clipsrc"; //初始化
+    string argu3 = "spat_extent"; //初始化
+    string VectorPath = mainworkpath + "/src/countries.shp";
+    string VectorBaseName = "countries";
+    string argu4 = "-f";
+    string argu5 = "\"ESRI Shapefile\"";
+    string exProgram = program + space + argu1 + space + sxmin + space + symax + space + sxmax + space + symin + space + argu2 + space + argu3 + space + sSmallVectorPath + space + VectorPath + space + VectorBaseName + space + argu4 + space + argu5;
+    //system(("export PATH="+mainworkpath+":$PATH").c_str());
+    //cout << exProgram << endl;
+    system(exProgram.c_str());
+    //读取矢量数据
+    //OGRDataSource* poVectorDs = OGRSFDriverRegistrar::Open(SmallVectorPath);
+
+    GDALDataset* poVectorDs = (GDALDataset*)GDALOpenEx(SmallVectorPath,GDAL_OF_VECTOR,nullptr,nullptr,nullptr);
+    if (poVectorDs == nullptr)
+    {
+        cout << "read shape false" << endl;
+        return false;
+    }
+    int iVectorLayers = poVectorDs->GetLayerCount();//获取矢量图层个数
+    if (iVectorLayers != 1)
+    {
+        cout << "the method only support one layer" << endl;
+        return false;
+    }
+    OGRLayer* poVectorLayer = poVectorDs->GetLayer(0);//这里只支持一个图层
+    if (poVectorLayer == nullptr)
+    {
+        cout << "open the layer false" << endl;
+        return false;
+    }
+    //处理输入的矢量数据
+    poVectorLayer->ResetReading();//将图层重置，标号从0开始
+    OGRFeature* poFeature = nullptr;//定义包含几何和属性的要素指针
+    OGRGeometry* ptrGeometry = nullptr;
+    int iFeatureNum = 0;
+    while ((poFeature = poVectorLayer->GetNextFeature()) != nullptr)
+    {
+        ptrGeometry = poFeature->GetGeometryRef();
+        iFeatureNum++;
+        if (wkbFlatten(ptrGeometry->getGeometryType()) != wkbPolygon)
+        {
+            OGRMultiPolygon* ptrMultiPolygon = (OGRMultiPolygon*)ptrGeometry->clone();
+            if(ptrMultiPolygon !=nullptr)
+            {
+                for (int i = 0; i < ptrMultiPolygon->getNumGeometries(); i++)
+                {
+                    vector<HLPoint> tempPolygon;
+                    HLPoint tempMin = HLPoint();
+                    HLPoint tempMax = HLPoint();
+                    OGRPolygon* ptrPolygon = (OGRPolygon*)ptrMultiPolygon->getGeometryRef(i);
+                    if(ptrPolygon == nullptr)
+                    {
+                        return false;
+                    }
+                    OGRLinearRing* ptrOGRLinearRing = ptrPolygon->getExteriorRing();//获取多边形的外环点的指针
+                    if(ptrOGRLinearRing == nullptr)
+                    {
+                        return false;
+                    }
+                    int numExterRing = ptrOGRLinearRing->getNumPoints();//外环点数
+                    tempMin.x = ptrOGRLinearRing->getX(0);
+                    tempMin.y = ptrOGRLinearRing->getY(0);
+                    tempMax.x = ptrOGRLinearRing->getX(0);
+                    tempMax.y = ptrOGRLinearRing->getY(0);
+                    getLocation(tempMin.x,tempMin.y,transform2,GeoTrans);
+                    getLocation(tempMax.x,tempMax.y,transform2,GeoTrans);
+                    for (int j = 0; j < numExterRing; j++)
+                    {
+                        HLPoint tempPoint = HLPoint();
+                        tempPoint.x = ptrOGRLinearRing->getX(j);
+                        tempPoint.y = ptrOGRLinearRing->getY(j);
+                        getLocation(tempPoint.x,tempPoint.y,transform2,GeoTrans);
+                        if (tempPoint.x > tempMax.x)
+                        {
+                            tempMax.x = tempPoint.x;
+                        }
+                        if (tempPoint.x < tempMin.x)
+                        {
+                            tempMin.x = tempPoint.x;
+                        }
+                        if (tempPoint.y > tempMax.y)
+                        {
+                            tempMax.y = tempPoint.y;
+                        }
+                        if (tempPoint.y < tempMin.y)
+                        {
+                            tempMin.y = tempPoint.y;
+                        }
+                        tempPolygon.push_back(tempPoint);
+                    }
+                    tempPolygon.push_back(tempMin);
+                    tempPolygon.push_back(tempMax);
+                    land_polygons.push_back(tempPolygon);
+                }
+            }
+        }
+        else
+        {
+            OGRPolygon* ptrPolygon = (OGRPolygon*)ptrGeometry->clone();
+            if(ptrPolygon == nullptr)
+            {
+                return false;
+            }
+            OGRLinearRing* ptrOGRLinearRing = ptrPolygon->getExteriorRing();//获取多边形的外环点的指针
+            if(ptrOGRLinearRing == nullptr)
+            {
+                return false;
+            }
+            int numExterRing = ptrOGRLinearRing->getNumPoints();//外环点数
+            vector<HLPoint> tempPolygon;
+            HLPoint tempMin = HLPoint();
+            HLPoint tempMax = HLPoint();
+            tempMin.x = ptrOGRLinearRing->getX(0);
+            tempMin.y = ptrOGRLinearRing->getY(0);
+            tempMax.x = ptrOGRLinearRing->getX(0);
+            tempMax.y = ptrOGRLinearRing->getY(0);
+            getLocation(tempMin.x,tempMin.y,transform2,GeoTrans);
+            getLocation(tempMax.x,tempMax.y,transform2,GeoTrans);
+            for (int j = 0; j < numExterRing; j++)
+            {
+                HLPoint tempPoint = HLPoint();
+                tempPoint.x = ptrOGRLinearRing->getX(j);
+                tempPoint.y = ptrOGRLinearRing->getY(j);
+                getLocation(tempPoint.x,tempPoint.y,transform2,GeoTrans);
+                if (tempPoint.x > tempMax.x)
+                {
+                    tempMax.x = tempPoint.x;
+                }
+                if (tempPoint.x < tempMin.x)
+                {
+                    tempMin.x = tempPoint.x;
+                }
+                if (tempPoint.y > tempMax.y)
+                {
+                    tempMax.y = tempPoint.y;
+                }
+                if (tempPoint.y < tempMin.y)
+                {
+                    tempMin.y = tempPoint.y;
+                }
+
+                tempPolygon.push_back(tempPoint);
+            }
+            tempPolygon.push_back(tempMin);
+            tempPolygon.push_back(tempMax);
+            land_polygons.push_back(tempPolygon);
+        }
+        OGRFeature::DestroyFeature(poFeature);
+    }
+    int Scale = 16;//缩放因子
+    int iSWidth = width / Scale;//缩放后的宽度
+    int iSHeight = height / Scale;//缩放后的高度
+    //处理数据
+    for (int i = 0; i < land_polygons.size(); i++)
+    {
+        vector<HLPoint> PolygonProcessing = land_polygons[i];//正在处理的多边形
+        int PolygonPoints = PolygonProcessing.size();//包括重复的首点、大小点的数量
+        double dMinX = PolygonProcessing[PolygonPoints - 2].x;
+        double dMinY = PolygonProcessing[PolygonPoints - 2].y;
+        double dMaxX = PolygonProcessing[PolygonPoints - 1].x;
+        double dMaxY = PolygonProcessing[PolygonPoints - 1].y;
+        double dStartX = oricol;
+        double dStartY = orirow;
+        long long iMaxRow = (dMaxY - dStartY) /Scale + 1;
+        long long iMinRow = (dMinY - dStartY) / Scale -1;
+        long long iMinCol = (dMinX - dStartX) / Scale -1;
+        long long iMaxCol = (dMaxX - dStartX) /Scale + 1;
+        for (long long m = iMinRow; m <= iMaxRow; m++)
+        {
+            for (long long n = iMinCol; n <= iMaxCol; n++)
+            {
+                double dJudgeX = dStartX + n * Scale;
+                double dJudgeY = dStartY + m * Scale;
+                HLPoint JudgePoint = HLPoint();
+                JudgePoint.x = dJudgeX;
+                JudgePoint.y = dJudgeY;
+                if (isInPolygon(JudgePoint, &PolygonProcessing))
+                {
+                    //cout << "is in" << endl;
+                    long long oristartrow = m * Scale - 2 * Scale;
+                    long long oristartcol = n * Scale - 2 * Scale;
+
+                    for (long long k = 0; k < 4 * Scale; k++)
+                    {
+                        for (long long l = 0; l < 4 * Scale; l++)
+                        {
+                            if ((oristartrow + k) >= 0 && (oristartrow + k) < height && (oristartcol + l) >= 0 && (oristartcol + l) < width)
+                            {
+                                mask[(oristartrow + k) * width + (oristartcol + l)] = 0;
+                            }
+                        }
+                    }
+                    //pInputRaster[m*iWidth + n] = 0;
+                }
+            }
+        }
+    }
+    cout << "calculate success!" << endl;
+    GDALClose(poRasterDs);
+    GDALClose(poVectorDs);
+    //OGRCleanupAll();
+    return true;
+}
+
+//************************************
+// Method:    getLocation
+// FullName:  SeaMask::getLocation
+// Access:    public
+// Returns:   None
+// Qualifier: 得到位置点包括横坐标和纵坐标
+// Parameter: double &x 结果点横坐标
+// Parameter: double &y 结果点纵坐标
+// Parameter: OGRCoordinateTransformation *transform 6参数
+// Parameter: double *geotrans 投影坐标
+//************************************
+void getLocation(double &x,double &y,OGRCoordinateTransformation *transform,double *geotrans)
+{
+    double xtemp = x;
+    double ytemp = y;
+    transform->Transform(1,&xtemp,&ytemp);
+    x = (xtemp-geotrans[0])/geotrans[1];
+    y = (ytemp - geotrans[3])/geotrans[5];
+}
+//射线法
+//射线法
+//************************************
+// Method:    isInPolygon
+// FullName:  SeaMask::isInPolygon
+// Access:    public
+// Returns:   bool
+// Qualifier: 判断点是否在多边形内部
+// Parameter: HLPoint p 点类型
+// Parameter: vector<HLPoint>* polygon 多边形
+//************************************
+bool isInPolygon(HLPoint p, vector<HLPoint>* polygon)
+{
+    int iLinesNum = (*polygon).size() - 3;
+    int iCross = 0;//交点数量
+
+    for (int i = 0; i < iLinesNum; i++)
+    {
+        HLPoint p1 = HLPoint(), p2 = HLPoint();
+        p1 = (*polygon)[i];
+        p2 = (*polygon)[i + 1];
+
+        //cout << p1.x << "," << p1.y << endl;
+        if (p1.y == p2.y)
+        {
+            continue;
+        }
+        if (p.y < MyMin(p1.y, p2.y))
+        {
+            continue;
+        }
+        if (p.y >= MyMax(p1.y, p2.y))
+        {
+            continue;
+        }
+        double xx = (p.y - p1.y)*(p2.x - p1.x) / (p2.y - p1.y) + p1.x;
+        if (xx > p.x)
+        {
+            iCross++;
+        }
+    }
+    return(iCross % 2 == 1);
+}
+
+//************************************
+// Method:    MyMin
+// FullName:  SeaMask::MyMin
+// Access:    public
+// Returns:   double
+// Qualifier: 返回较小值
+// Parameter: double a 比较值
+// Parameter: double b 比较值
+//************************************
+double MyMin(double a, double b)
+{
+    if (a >= b)
+    {
+        return b;
+    }
+    else
+    {
+        return a;
+    }
+}
+
+//************************************
+// Method:    MyMax
+// FullName:  SeaMask::MyMax
+// Access:    public
+// Returns:   double
+// Qualifier: 返回较大值
+// Parameter: double a 比较值
+// Parameter: double b 比较值
+//************************************
+double MyMax(double a, double b)
+{
+    if (a >= b)
+    {
+        return a;
+    }
+    else
+    {
+        return b;
+    }
+}
